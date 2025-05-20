@@ -20,9 +20,7 @@ const scene = new THREE.Scene();
 const parameters = {};
 parameters.count = 10000;
 parameters.size = 0.02;
-parameters.radius = 5;
-parameters.branches = 3;
-parameters.spin = 1;
+parameters.radius = 10;
 parameters.randomness = 0.2;
 parameters.randomnessPower = 3;
 parameters.insideColor = "#ff6030";
@@ -31,8 +29,24 @@ parameters.outsideColor = "#1b3984";
 let geometry = null;
 let material = null;
 let points = null;
+let originalPositions = null;
 
-const generateGalaxy = () => {
+const mouse = new THREE.Vector2();
+let prevMouse = new THREE.Vector2();
+let mouseSpeed = 0;
+
+document.addEventListener("mousemove", (event) => {
+  const newMouse = new THREE.Vector2(
+    (event.clientX / window.innerWidth) * 2 - 1,
+    -(event.clientY / window.innerHeight) * 2 + 1
+  );
+
+  mouseSpeed = newMouse.distanceTo(prevMouse);
+  prevMouse.copy(newMouse);
+  mouse.copy(newMouse);
+});
+
+const generateParticles = () => {
   // Destroy old galaxy
   if (points !== null) {
     geometry.dispose();
@@ -42,6 +56,8 @@ const generateGalaxy = () => {
 
   geometry = new THREE.BufferGeometry();
   const positions = new Float32Array(parameters.count * 3);
+  originalPositions = new Float32Array(parameters.count * 3);
+  const radius = 3;
   const colors = new Float32Array(parameters.count * 3);
 
   const colorInside = new THREE.Color(parameters.insideColor);
@@ -49,33 +65,16 @@ const generateGalaxy = () => {
 
   for (let i = 0; i < parameters.count; i++) {
     const i3 = i * 3;
+    const phi = Math.acos(1 - 2 * Math.random());
+    const theta = Math.random() * 2 * Math.PI;
 
-    // Position
-    // const radius =
-    //   Math.pow(Math.random(), parameters.randomnessPower) * parameters.radius;
-    const randomRadius = Math.random() * parameters.radius;
-    const gradientRadius =
-      Math.pow(Math.random(), parameters.randomnessPower) * parameters.radius;
-    const radius =
-      randomRadius > parameters.radius * parameters.randomness
-        ? gradientRadius
-        : randomRadius;
-    const branchAngle = ((i % parameters.branches) / parameters.branches) * Math.PI * 2;
-    const spinAngle = radius * parameters.spin;
+    positions[i3] = radius * Math.sin(phi) * Math.cos(theta);
+    positions[i3 + 1] = radius * Math.sin(phi) * Math.sin(theta);
+    positions[i3 + 2] = radius * Math.cos(phi);
 
-    const randomX =
-      Math.pow(Math.random(), parameters.randomnessPower) *
-      (Math.random() > 0.5 ? 1 : -1);
-    const randomY =
-      Math.pow(Math.random(), parameters.randomnessPower) *
-      (Math.random() > 0.5 ? 1 : -1);
-    const randomZ =
-      Math.pow(Math.random(), parameters.randomnessPower) *
-      (Math.random() > 0.5 ? 1 : -1);
-
-    positions[i3 + 0] = Math.cos(branchAngle + spinAngle) * radius + randomX;
-    positions[i3 + 1] = randomY;
-    positions[i3 + 2] = Math.sin(branchAngle + spinAngle) * radius + randomZ;
+    originalPositions[i3] = positions[i3];
+    originalPositions[i3 + 1] = positions[i3 + 1];
+    originalPositions[i3 + 2] = positions[i3 + 2];
 
     // Color
     const mixedColor = colorInside.clone();
@@ -99,7 +98,7 @@ const generateGalaxy = () => {
   points = new THREE.Points(geometry, material);
   scene.add(points);
 };
-generateGalaxy();
+generateParticles();
 
 // Tweaks
 gui
@@ -107,31 +106,29 @@ gui
   .min(1000)
   .max(100000)
   .step(100)
-  .onFinishChange(generateGalaxy);
+  .onFinishChange(generateParticles);
 gui
   .add(parameters, "size")
   .min(0.001)
   .max(0.1)
   .step(0.001)
-  .onFinishChange(generateGalaxy);
+  .onFinishChange(generateParticles);
 
-gui.add(parameters, "radius").min(1).max(20).step(0.1).onFinishChange(generateGalaxy);
-gui.add(parameters, "branches").min(2).max(10).step(1).onFinishChange(generateGalaxy);
-gui.add(parameters, "spin").min(-5).max(5).step(0.001).onFinishChange(generateGalaxy);
+gui.add(parameters, "radius").min(1).max(20).step(0.1).onFinishChange(generateParticles);
 gui
   .add(parameters, "randomness")
   .min(0)
   .max(1)
   .step(0.001)
-  .onFinishChange(generateGalaxy);
+  .onFinishChange(generateParticles);
 gui
   .add(parameters, "randomnessPower")
   .min(1)
   .max(10)
   .step(0.001)
-  .onFinishChange(generateGalaxy);
-gui.addColor(parameters, "insideColor").onFinishChange(generateGalaxy);
-gui.addColor(parameters, "outsideColor").onFinishChange(generateGalaxy);
+  .onFinishChange(generateParticles);
+gui.addColor(parameters, "insideColor").onFinishChange(generateParticles);
+gui.addColor(parameters, "outsideColor").onFinishChange(generateParticles);
 
 /**
  * Sizes
@@ -162,7 +159,7 @@ window.addEventListener("resize", () => {
 const camera = new THREE.PerspectiveCamera(75, sizes.width / sizes.height, 0.1, 100);
 camera.position.x = 3;
 camera.position.y = 3;
-camera.position.z = 3;
+camera.position.z = 5;
 scene.add(camera);
 
 // Controls
@@ -185,6 +182,30 @@ const clock = new THREE.Clock();
 
 const tick = () => {
   const elapsedTime = clock.getElapsedTime();
+
+  const p_pos = points.geometry.attributes.position.array;
+  const maxDistortionForce = 0.5;
+  const speedMultiplier = 20;
+
+  for (let i = 0; i < p_pos.length; i += 3) {
+    const dx = p_pos[i] - mouse.x * 5;
+    const dy = p_pos[i + 1] - mouse.y * 5;
+    const distance = Math.sqrt(dx * dx + dy * dy);
+
+    const distortionAmount =
+      (1 - Math.min(distance, 1)) * maxDistortionForce * mouseSpeed * speedMultiplier;
+
+    if (distortionAmount > 0.06) {
+      p_pos[i] += (dx / distance) * distortionAmount;
+      p_pos[i + 1] += (dy / distance) * distortionAmount;
+    } else {
+      p_pos[i] += (originalPositions[i] - p_pos[i]) * 0.05;
+      p_pos[i + 1] += (originalPositions[i + 1] - p_pos[i + 1]) * 0.05;
+      p_pos[i + 2] += (originalPositions[i + 2] - p_pos[i + 2]) * 0.05;
+    }
+  }
+
+  points.geometry.attributes.position.needsUpdate = true;
 
   // Update controls
   controls.update();
