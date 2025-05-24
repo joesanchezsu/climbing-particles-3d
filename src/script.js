@@ -3,8 +3,10 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import GUI from "lil-gui";
 import * as poseDetection from "@tensorflow-models/pose-detection";
 import "@mediapipe/pose";
+import { OneEuroFilter } from "1eurofilter";
 
 console.log({ poseDetection });
+console.log({ OneEuroFilter });
 /**
  * Base
  */
@@ -56,6 +58,38 @@ const edges = [
   [26, 28],
 ];
 
+/**
+ * One Euro Filter
+ */
+const NUM_KEYPOINTS = 33;
+const CONFIDENCE_THRESHOLD = 0.2; // Your existing threshold
+const MAX_FRAMES_TO_HOLD = 5; // Grace period: e.g., 5 frames. Tune this value!
+
+// Parameters for OneEuroFilter: minCutoff, beta (speed coefficient)
+// You'll need to tune these!
+const videoFrameRate = 60; // An estimate of your video/detection rate
+const frequency = 10; //120; // Hz, estimated signal frequency
+const filterMinCutoff = 1.0; // Lower for more smoothing, higher for less lag
+const filterBeta = 0.1; // Higher for more smoothing of high-speed motion
+const filterDerivCutoff = 1.0; /// videoFrameRate; // Cutoff for derivative, default is 1.0
+
+const keypointStates = [];
+for (let i = 0; i < NUM_KEYPOINTS; i++) {
+  keypointStates.push({
+    filterX: new OneEuroFilter(frequency, filterMinCutoff, filterBeta, filterDerivCutoff),
+    filterY: new OneEuroFilter(frequency, filterMinCutoff, filterBeta, filterDerivCutoff),
+    filterZ: new OneEuroFilter(frequency, filterMinCutoff, filterBeta, filterDerivCutoff),
+    lastFilteredPosition: new THREE.Vector3(), // Stores the most recent filtered output
+    // For temporal consistency
+    framesSinceLastGoodDetection: 0, // Counter for low-confidence frames
+    hadRecentGoodDetection: false, // Was it good recently within the hold window?
+    isVisibleForRender: false, // Final decision: render this keypoint this frame?
+  });
+}
+
+/**
+ * Skeleton
+ */
 const boneMaterial = new THREE.LineBasicMaterial({ color: 0x00ffff });
 const boneGeometry = new THREE.BufferGeometry();
 const bonePositions = new Float32Array(edges.length * 6); // 2 points per edge
@@ -67,40 +101,45 @@ scene.add(skeleton);
  * Particle system
  */
 const parameters = {};
-parameters.count = 3000;
+parameters.count = 10000;
 parameters.size = 0.02;
-parameters.radius = 10;
+parameters.radius = 3;
+parameters.distance = 1.3;
+parameters.maxDistortionForce = 1;
+parameters.jointForceMultiplier = 0.2;
+parameters.particleReturnStrength = 0.01;
+
 parameters.randomness = 0.2;
 parameters.randomnessPower = 3;
 parameters.insideColor = "#ff6030";
 parameters.outsideColor = "#1b3984";
+parameters.restartVideo = () => {
+  const video = document.getElementById("video");
+  video.currentTime = 0;
+  video.play();
+  lastDetectionTime = 0; // Good, you have this
+
+  // Reset keypoint states and filters
+  for (let i = 0; i < NUM_KEYPOINTS; i++) {
+    keypointStates[i].filterX.reset(); // Assuming 1eurofilter has a .reset() or re-instantiate
+    keypointStates[i].filterY.reset();
+    keypointStates[i].filterZ.reset();
+    keypointStates[i].lastFilteredPosition.set(0, 0, 0); // Or some initial sensible value
+    keypointStates[i].framesSinceLastGoodDetection = 0;
+    keypointStates[i].hadRecentGoodDetection = false;
+    keypointStates[i].isVisibleForRender = false;
+  }
+
+  if (poses) poses = null; // Clear last known poses
+};
 
 let geometry = null;
 let material = null;
 let points = null;
 let originalPositions = null;
 
-/**
- * Mouse interactions
- */
-
-// const mouse = new THREE.Vector2();
-// let prevMouse = new THREE.Vector2();
-// let mouseSpeed = 0;
-
-// document.addEventListener("mousemove", (event) => {
-//   const newMouse = new THREE.Vector2(
-//     (event.clientX / window.innerWidth) * 2 - 1,
-//     -(event.clientY / window.innerHeight) * 2 + 1
-//   );
-
-//   mouseSpeed = newMouse.distanceTo(prevMouse);
-//   prevMouse.copy(newMouse);
-//   mouse.copy(newMouse);
-// });
-
 const generateParticles = () => {
-  // Destroy old galaxy
+  // Destroy old particles
   if (points !== null) {
     geometry.dispose();
     material.dispose();
@@ -110,7 +149,6 @@ const generateParticles = () => {
   geometry = new THREE.BufferGeometry();
   const positions = new Float32Array(parameters.count * 3);
   originalPositions = new Float32Array(parameters.count * 3);
-  const radius = 1.5;
   const colors = new Float32Array(parameters.count * 3);
 
   const colorInside = new THREE.Color(parameters.insideColor);
@@ -120,10 +158,11 @@ const generateParticles = () => {
     const i3 = i * 3;
     const phi = Math.acos(1 - 2 * Math.random());
     const theta = Math.random() * 2 * Math.PI;
+    const r = Math.random() * parameters.radius;
 
-    positions[i3] = radius * Math.sin(phi) * Math.cos(theta);
-    positions[i3 + 1] = radius * Math.sin(phi) * Math.sin(theta);
-    positions[i3 + 2] = radius * Math.cos(phi);
+    positions[i3] = r * Math.sin(phi) * Math.cos(theta);
+    positions[i3 + 1] = r * Math.sin(phi) * Math.sin(theta);
+    positions[i3 + 2] = r * Math.cos(phi);
 
     originalPositions[i3] = positions[i3];
     originalPositions[i3 + 1] = positions[i3 + 1];
@@ -131,7 +170,7 @@ const generateParticles = () => {
 
     // Color
     const mixedColor = colorInside.clone();
-    mixedColor.lerp(colorOutside, radius / parameters.radius);
+    mixedColor.lerp(colorOutside, 0, parameters.radius);
     colors[i3 + 0] = mixedColor.r;
     colors[i3 + 1] = mixedColor.g;
     colors[i3 + 2] = mixedColor.b;
@@ -168,6 +207,25 @@ gui
   .onFinishChange(generateParticles);
 
 gui.add(parameters, "radius").min(1).max(20).step(0.1).onFinishChange(generateParticles);
+gui.add(parameters, "distance").min(0).max(5).step(0.1).onFinishChange(generateParticles);
+gui
+  .add(parameters, "maxDistortionForce")
+  .min(0)
+  .max(5)
+  .step(0.1)
+  .onFinishChange(generateParticles);
+gui
+  .add(parameters, "jointForceMultiplier")
+  .min(0)
+  .max(3)
+  .step(0.01)
+  .onFinishChange(generateParticles);
+gui
+  .add(parameters, "particleReturnStrength")
+  .min(0)
+  .max(0.02)
+  .step(0.001)
+  .onFinishChange(generateParticles);
 gui
   .add(parameters, "randomness")
   .min(0)
@@ -182,6 +240,7 @@ gui
   .onFinishChange(generateParticles);
 gui.addColor(parameters, "insideColor").onFinishChange(generateParticles);
 gui.addColor(parameters, "outsideColor").onFinishChange(generateParticles);
+gui.add(parameters, "restartVideo").name("Restart Video");
 
 /**
  * Sizes
@@ -231,7 +290,7 @@ renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 /**
  * Video
  */
-document.addEventListener("click", () => {
+document.addEventListener("dblclick", () => {
   const video = document.getElementById("video");
   if (video.paused) {
     video.play();
@@ -239,102 +298,161 @@ document.addEventListener("click", () => {
     video.pause();
   }
 });
+video.addEventListener("timeupdate", () => {
+  if (video.currentTime >= 40) {
+    video.pause();
+    video.currentTime = 40; // optional: clamp exactly to 40s
+  }
+});
 
 /**
  * Animate
  */
-setInterval(async () => {
-  if (detector) {
-    poses = await detector.estimatePoses(video, estimationConfig);
-  }
-}, 100); // run at 10 FPS
 
 const clock = new THREE.Clock();
+const detectionInterval = 100; // ms, for 10 FPS
+let lastDetectionTime = 0;
 
 const tick = async () => {
   const elapsedTime = clock.getElapsedTime();
+  const timestamp = video.currentTime; // More accurate for video frame content than elapsedTime for filter
 
-  if (poses && !video.paused && !video.ended) {
-    if (poses.length > 0 && poses[0].keypoints3D) {
-      const kps = poses[0].keypoints3D;
+  const cond = detector && timestamp - lastDetectionTime > detectionInterval / 1000;
 
-      // Update joints
-      kps.forEach((kp, i) => {
-        if (kp && kp.score > 0.4) {
-          joints[i].visible = true;
-          joints[i].position.set(kp.x, -kp.y, -kp.z); // Adjust y/z as needed
+  if (cond && !video.paused && !video.ended) {
+    lastDetectionTime = timestamp;
+    poses = await detector.estimatePoses(video, estimationConfig);
+  }
+
+  if (poses && poses.length > 0 && poses[0].keypoints3D) {
+    const kps = poses[0].keypoints3D;
+
+    // Update joints
+    kps.forEach((kp, i) => {
+      const state = keypointStates[i];
+
+      if (kp && kp.score > CONFIDENCE_THRESHOLD) {
+        // Good detection!
+        // Update filters with new raw data
+        // Remember MediaPipe's Y is often inverted for typical 3D viewing
+
+        state.lastFilteredPosition.x = state.filterX.filter(kp.x, timestamp);
+        state.lastFilteredPosition.y = state.filterY.filter(-kp.y, timestamp);
+        state.lastFilteredPosition.z = state.filterZ.filter(-kp.z, timestamp);
+
+        state.framesSinceLastGoodDetection = 0;
+        state.hadRecentGoodDetection = true;
+        state.isVisibleForRender = true;
+      } else {
+        // Low confidence or no detection for this keypoint
+        state.framesSinceLastGoodDetection++;
+
+        if (
+          state.framesSinceLastGoodDetection <= MAX_FRAMES_TO_HOLD &&
+          state.hadRecentGoodDetection
+        ) {
+          // Within grace period AND it was recently good: Hold the last filtered position.
+          // The filter itself is not updated with new (bad) data, so lastFilteredPosition
+          // still holds the value from the last good update.
+          state.isVisibleForRender = true;
         } else {
-          joints[i].visible = false;
-        }
-      });
-
-      // Update bones
-      edges.forEach((edge, idx) => {
-        const [i1, i2] = edge;
-        const kp1 = kps[i1];
-        const kp2 = kps[i2];
-        const arr = skeleton.geometry.attributes.position.array;
-        if (kp1 && kp2 && kp1.score > 0.4 && kp2.score > 0.4) {
-          arr.set([kp1.x, -kp1.y, -kp1.z, kp2.x, -kp2.y, -kp2.z], idx * 6);
-        } else {
-          arr.set([0, 0, 0, 0, 0, 0], idx * 6); // Hide if low confidence
-        }
-      });
-
-      const p_pos = points.geometry.attributes.position.array;
-      const maxDistortionForce = 1.5;
-      const jointForceMultiplier = 0.05;
-      // const speedMultiplier = 20;
-
-      for (let i = 0; i < p_pos.length; i += 3) {
-        let fx = 0;
-        let fy = 0;
-
-        // Influence from joints
-        joints.forEach((joint) => {
-          if (!joint.visible) return;
-
-          const dx = p_pos[i] - joint.position.x;
-          const dy = p_pos[i + 1] - joint.position.y;
-          const distance = Math.sqrt(dx * dx + dy * dy);
-
-          if (distance < 0.2) {
-            const force = (1 - distance) * maxDistortionForce;
-            fx += (dx / distance) * force;
-            fy += (dy / distance) * force;
-          }
-        });
-
-        // Influence from mouse
-        // const dx = p_pos[i] - mouse.x * 5;
-        // const dy = p_pos[i + 1] - mouse.y * 5;
-        // const distance = Math.sqrt(dx * dx + dy * dy);
-        // const distortionAmount =
-        //   (1 - Math.min(distance, 1)) * maxDistortionForce * mouseSpeed * speedMultiplier;
-
-        // if (distortionAmount > 0.06) {
-        //   p_pos[i] += (dx / distance) * distortionAmount;
-        //   p_pos[i + 1] += (dy / distance) * distortionAmount;
-        // } else {
-        //   p_pos[i] += (originalPositions[i] - p_pos[i]) * 0.05;
-        //   p_pos[i + 1] += (originalPositions[i + 1] - p_pos[i + 1]) * 0.05;
-        //   p_pos[i + 2] += (originalPositions[i + 2] - p_pos[i + 2]) * 0.05;
-        // }
-
-        // Apply joint force or restore to origin
-        if (Math.abs(fx) > 0.001 || Math.abs(fy) > 0.001) {
-          p_pos[i] += fx * jointForceMultiplier;
-          p_pos[i + 1] += fy * jointForceMultiplier;
-        } else {
-          p_pos[i] += (originalPositions[i] - p_pos[i]) * 0.05;
-          p_pos[i + 1] += (originalPositions[i + 1] - p_pos[i + 1]) * 0.05;
-          p_pos[i + 2] += (originalPositions[i + 2] - p_pos[i + 2]) * 0.05;
+          // Grace period expired or it was never good recently
+          state.isVisibleForRender = false;
+          state.hadRecentGoodDetection = false; // Ensure this is reset
         }
       }
 
-      skeleton.geometry.attributes.position.needsUpdate = true;
-      points.geometry.attributes.position.needsUpdate = true;
+      // Update the Three.js joint object
+      joints[i].visible = state.isVisibleForRender;
+      if (state.isVisibleForRender) {
+        joints[i].position.copy(state.lastFilteredPosition);
+      }
+    });
+
+    // Update bones based on the new isVisibleForRender status
+    const bonePositions = skeleton.geometry.attributes.position.array;
+    edges.forEach((edge, idx) => {
+      const [idx1, idx2] = edge;
+      const state1 = keypointStates[idx1];
+      const state2 = keypointStates[idx2];
+
+      if (state1.isVisibleForRender && state2.isVisibleForRender) {
+        bonePositions.set(
+          [
+            state1.lastFilteredPosition.x,
+            state1.lastFilteredPosition.y,
+            state1.lastFilteredPosition.z,
+            state2.lastFilteredPosition.x,
+            state2.lastFilteredPosition.y,
+            state2.lastFilteredPosition.z,
+          ],
+          idx * 6
+        );
+      } else {
+        // Hide the bone if either connected joint is not rendered
+        bonePositions.set([0, 0, 0, 0, 0, 0], idx * 6); // Or set to NaN, or manage visibility differently
+      }
+    });
+    skeleton.geometry.attributes.position.needsUpdate = true;
+
+    const p_pos = points.geometry.attributes.position.array;
+
+    for (let i = 0; i < p_pos.length; i += 3) {
+      let fx = 0;
+      let fy = 0;
+      let fz = 0;
+
+      // Influence from joints
+      joints.forEach((joint) => {
+        if (!joint.visible) return;
+
+        const dx = p_pos[i] - joint.position.x;
+        const dy = p_pos[i + 1] - joint.position.y;
+        const dz = p_pos[i + 2] - joint.position.z;
+        const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+        if (distance < parameters.distance) {
+          const force = (1 - distance) * parameters.maxDistortionForce;
+          fx += (dx / distance) * force;
+          fy += (dy / distance) * force;
+          fz += (dz / distance) * force;
+        }
+      });
+
+      // Apply joint force or restore to origin
+      if (Math.abs(fx) > 0.001 || Math.abs(fy) > 0.001 || Math.abs(fz) > 0.001) {
+        p_pos[i] += fx * parameters.jointForceMultiplier;
+        p_pos[i + 1] += fy * parameters.jointForceMultiplier;
+        p_pos[i + 2] += fz * parameters.jointForceMultiplier;
+      } else {
+        p_pos[i] += (originalPositions[i] - p_pos[i]) * parameters.particleReturnStrength;
+        p_pos[i + 1] +=
+          (originalPositions[i + 1] - p_pos[i + 1]) * parameters.particleReturnStrength;
+        p_pos[i + 2] +=
+          (originalPositions[i + 2] - p_pos[i + 2]) * parameters.particleReturnStrength;
+      }
     }
+
+    skeleton.geometry.attributes.position.needsUpdate = true;
+    points.geometry.attributes.position.needsUpdate = true;
+  } else if (
+    poses &&
+    poses.length === 0 &&
+    keypointStates.some((s) => s.isVisibleForRender)
+  ) {
+    // No person detected at all, hide all keypoints if any were visible
+    keypointStates.forEach((state) => {
+      state.isVisibleForRender = false;
+      state.hadRecentGoodDetection = false; // Reset tracking
+    });
+
+    joints.forEach((joint) => (joint.visible = false));
+    const bonePositions = skeleton.geometry.attributes.position.array;
+    for (let i = 0; i < bonePositions.length; i++) {
+      // A way to clear all bones
+      bonePositions[i] = 0;
+    }
+    skeleton.geometry.attributes.position.needsUpdate = true;
   }
 
   // Update controls
